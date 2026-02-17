@@ -1,26 +1,9 @@
 /**
- * Cloudflare Worker 多项目部署管理器 (V10.2.0 - Starfield Theme)
- * 更新日志 (V10.2.0)：
- * 1. [Feature] 新增暗黑星空模式 / 明亮模式主题切换。
- * 2. [Feature] Canvas 动态星空背景（闪烁星星 + 流星 + 星云光晕）。
- * 3. [Feature] 卡片毛玻璃半透明效果，全组件暗黑模式适配。
- * 4. [Feature] 主题选择通过 localStorage 持久化。
- *
- * 更新日志 (V10.1.0)：
- * 1. [Feature] 管理弹窗新增修改账号 workers.dev 子域名前缀功能。
- * 2. [Feature] 新增 /api/get_subdomain 和 /api/change_subdomain 后端 API。
- * 3. [Improve] 管理弹窗并行加载 Workers 列表和子域名信息，提升加载速度。
- * 4. [UX] 修改子域名带二次确认对话框，防止误操作。
- *
- * 更新日志 (V10.0.0)：
- * 1. [Security] 登录改为 POST，密码不再通过 URL 明文传递；Cookie 增加 Secure 标志。
- * 2. [Security] API 增加 HTTP 方法校验，POST 请求增加 CSRF Origin 检查。
- * 3. [Fix] 修复 serverSideObfuscate 正则误删 URL 的严重 bug。
- * 4. [Fix] 修复前端 checkUpdate catch 变量名冲突导致错误不显示的 bug。
- * 5. [Fix] 修复编辑账号时 stats 被重置的问题。
- * 6. [Improve] 熔断和自动更新改为动态模板识别，不再硬编码。
- * 7. [Improve] 统一错误响应；前后端模板数据由后端注入，消除重复。
- * 8. [Improve] compatibility_date 自动使用当前日期。
+ * Cloudflare Worker 多项目部署管理器 (V10.6.0 - Starfield Theme)
+ * 更新日志 (V10.6.0)：
+ * 1. [Feature] 一键修复 1101：删除 → 改域名 → 重建 → 恢复变量+域名。
+ * 2. [Remove] 删除所有混淆功能。
+ * 完整历史版本记录见 CHANGELOG.md
  */
 
 // ==========================================
@@ -173,8 +156,8 @@ export default {
                 return await handleGetCode(env, type);
             }
             if (url.pathname === "/api/deploy" && request.method === "POST") {
-                const { type, variables, deletedVariables, targetSha } = await request.json();
-                return await handleManualDeploy(env, type, variables, deletedVariables, ACCOUNTS_KEY, targetSha);
+                const { type, variables, deletedVariables, targetSha, customCode } = await request.json();
+                return await handleManualDeploy(env, type, variables, deletedVariables, ACCOUNTS_KEY, targetSha, customCode);
             }
             if (url.pathname === "/api/batch_deploy" && request.method === "POST") {
                 const data = await request.json();
@@ -205,6 +188,10 @@ export default {
                 const { accountId, email, globalKey, newSubdomain } = await request.json();
                 return await handleChangeSubdomain(accountId, email, globalKey, newSubdomain);
             }
+            if (url.pathname === "/api/fix_1101" && request.method === "POST") {
+                const { type } = await request.json();
+                return await handleFix1101(env, type);
+            }
 
             return new Response(mainHtml(), { headers: { "Content-Type": "text/html;charset=UTF-8" } });
 
@@ -233,20 +220,7 @@ function getUploadHeaders(email, key) {
     return { "X-Auth-Email": email, "X-Auth-Key": key };
 }
 
-// [服务器端轻量混淆] 供自动更新/熔断使用，避免依赖 heavy libraries
-function serverSideObfuscate(code) {
-    // 1. 注入 Window Polyfill
-    if (!code.includes('var window = globalThis')) {
-        code = 'var window = globalThis;\n' + code;
-    }
-    // 2. 移除块注释 /* ... */ （安全）
-    code = code.replace(/\/\*[\s\S]*?\*\//g, '');
-    // 3. 仅移除行首单行注释（避免误删 URL 中的 //）
-    code = code.replace(/^\s*\/\/.*$/gm, '');
-    // 4. 压缩空白
-    code = code.replace(/^\s+|\s+$/gm, '').replace(/\n{2,}/g, '\n');
-    return code;
-}
+
 
 async function handleCronJob(env) {
     const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`;
@@ -259,8 +233,7 @@ async function handleCronJob(env) {
     const now = Date.now();
     const lastCheck = config.lastCheck || 0;
     const intervalMs = (parseInt(config.interval) || 30) * 60 * 1000;
-    // 读取自动混淆配置
-    const autoObfuscate = !!config.obfuscate;
+
 
     if (now - lastCheck <= intervalMs) return;
 
@@ -281,7 +254,7 @@ async function handleCronJob(env) {
                 // 动态识别需要熔断的模板（拥有 uuidField 的模板）
                 const fuseTypes = Object.entries(TEMPLATES).filter(([_, t]) => t.uuidField).map(([k]) => k);
                 for (const ft of fuseTypes) {
-                    await rotateUUIDAndDeploy(env, ft, accounts, ACCOUNTS_KEY, autoObfuscate);
+                    await rotateUUIDAndDeploy(env, ft, accounts, ACCOUNTS_KEY);
                 }
                 actionTaken = true;
                 break;
@@ -293,7 +266,7 @@ async function handleCronJob(env) {
         // [自动更新] 动态识别模板
         const updateTypes = Object.entries(TEMPLATES).filter(([_, t]) => t.uuidField).map(([k]) => k);
         await Promise.all(updateTypes.map(type =>
-            checkAndDeployUpdate(env, type, accounts, ACCOUNTS_KEY, autoObfuscate)
+            checkAndDeployUpdate(env, type, accounts, ACCOUNTS_KEY)
         ));
     }
 
@@ -301,7 +274,7 @@ async function handleCronJob(env) {
     await env.CONFIG_KV.put(GLOBAL_CONFIG_KEY, JSON.stringify(config));
 }
 
-async function checkAndDeployUpdate(env, type, accounts, accountsKey, doObfuscate) {
+async function checkAndDeployUpdate(env, type, accounts, accountsKey) {
     try {
         const deployConfig = JSON.parse(await env.CONFIG_KV.get(`DEPLOY_CONFIG_${type}`) || '{"mode":"latest"}');
         if (deployConfig.mode === 'fixed') return;
@@ -312,13 +285,12 @@ async function checkAndDeployUpdate(env, type, accounts, accountsKey, doObfuscat
         if (checkData.remote && (!checkData.local || checkData.remote.sha !== checkData.local.sha)) {
             const varsStr = await env.CONFIG_KV.get(`VARS_${type}`);
             const variables = varsStr ? JSON.parse(varsStr) : [];
-            // 传入 doObfuscate
-            await coreDeployLogic(env, type, variables, [], accountsKey, 'latest', doObfuscate);
+            await coreDeployLogic(env, type, variables, [], accountsKey, 'latest');
         }
     } catch (e) { console.error(`[Update Error] ${type}: ${e.message}`); }
 }
 
-async function rotateUUIDAndDeploy(env, type, accounts, accountsKey, doObfuscate) {
+async function rotateUUIDAndDeploy(env, type, accounts, accountsKey) {
     const VARS_KEY = `VARS_${type}`;
     const varsStr = await env.CONFIG_KV.get(VARS_KEY);
     let variables = varsStr ? JSON.parse(varsStr) : [];
@@ -335,8 +307,7 @@ async function rotateUUIDAndDeploy(env, type, accounts, accountsKey, doObfuscate
 
     const deployConfig = JSON.parse(await env.CONFIG_KV.get(`DEPLOY_CONFIG_${type}`) || '{"mode":"latest"}');
     const targetSha = deployConfig.mode === 'fixed' ? deployConfig.currentSha : 'latest';
-    // 传入 doObfuscate
-    await coreDeployLogic(env, type, variables, [], accountsKey, targetSha, doObfuscate);
+    await coreDeployLogic(env, type, variables, [], accountsKey, targetSha);
 }
 
 async function handleGetCode(env, type) {
@@ -386,35 +357,32 @@ async function handleCheckUpdate(env, type, mode, limit = 10) {
     } catch (e) { return new Response(JSON.stringify({ error: e.message }), { status: 500 }); }
 }
 
-async function handleManualDeploy(env, type, variables, deletedVariables, accountsKey, targetSha) {
-    // 手动部署时暂不自动应用服务器端混淆，依赖前端传参
+async function handleManualDeploy(env, type, variables, deletedVariables, accountsKey, targetSha, customCode) {
+    if (customCode) {
+        // 批量部署提供的前端混淆代码，直接使用
+        const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, customCode);
+        return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
+    }
     const result = await coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha);
     return new Response(JSON.stringify(result), { headers: { "Content-Type": "application/json" } });
 }
 
 async function handleBatchDeploy(env, reqData, accountsKey) {
-    const { template, workerName, kvName, config, targetAccounts, disableWorkersDev, customDomainPrefix, enableKV, customCode } = reqData;
+    const { template, workerName, kvName, config, targetAccounts, disableWorkersDev, customDomainPrefix, enableKV, savedVars } = reqData;
     const allAccounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
 
     const accountsToDeploy = allAccounts.filter(a => targetAccounts.includes(a.alias));
     if (accountsToDeploy.length === 0) return new Response(JSON.stringify([{ name: "错误", success: false, msg: "未选择有效账号" }]), { headers: { "Content-Type": "application/json" } });
 
     let scriptContent = "";
-    if (customCode) {
-        scriptContent = customCode;
-        if (!scriptContent.includes('var window = globalThis') && !scriptContent.includes('import ')) {
-            scriptContent = 'var window = globalThis;\n' + scriptContent;
-        }
-    } else {
-        const { scriptUrl } = getGithubUrls(template);
-        try {
-            const codeRes = await fetch(scriptUrl);
-            if (!codeRes.ok) throw new Error("代码拉取失败");
-            scriptContent = await codeRes.text();
-            if (template === 'joey') scriptContent = 'var window = globalThis;\n' + scriptContent;
-        } catch (e) {
-            return new Response(JSON.stringify([{ name: "网络错误", success: false, msg: e.message }]), { headers: { "Content-Type": "application/json" } });
-        }
+    const { scriptUrl } = getGithubUrls(template);
+    try {
+        const codeRes = await fetch(scriptUrl);
+        if (!codeRes.ok) throw new Error("代码拉取失败");
+        scriptContent = await codeRes.text();
+        if (template === 'joey') scriptContent = 'var window = globalThis;\n' + scriptContent;
+    } catch (e) {
+        return new Response(JSON.stringify([{ name: "网络错误", success: false, msg: e.message }]), { headers: { "Content-Type": "application/json" } });
     }
 
     const logs = [];
@@ -446,19 +414,29 @@ async function handleBatchDeploy(env, reqData, accountsKey) {
                 if (template === 'joey') bindings.push({ name: "C", type: "kv_namespace", namespace_id: nsId });
             }
 
-            if (config.admin) bindings.push({ name: "ADMIN", type: "plain_text", text: config.admin });
-            if (template === 'joey' && config.uuid) bindings.push({ name: "u", type: "plain_text", text: config.uuid });
-
-            const defaultVars = TEMPLATES[template].defaultVars;
-            defaultVars.forEach(key => {
-                if (key !== 'KV' && key !== 'C' && key !== 'ADMIN' && key !== 'u') {
-                    if (key === 'UUID') {
-                        bindings.push({ name: "UUID", type: "plain_text", text: config.uuid || crypto.randomUUID() });
-                    } else {
-                        bindings.push({ name: key, type: "plain_text", text: "" });
+            // 如果前端传了已保存变量，优先使用
+            if (savedVars && Array.isArray(savedVars) && savedVars.length > 0) {
+                savedVars.forEach(v => {
+                    if (v.key && !bindings.find(b => b.name === v.key)) {
+                        bindings.push({ name: v.key, type: "plain_text", text: v.value || "" });
                     }
-                }
-            });
+                });
+            } else {
+                // 回退到 config 配置
+                if (config.admin) bindings.push({ name: "ADMIN", type: "plain_text", text: config.admin });
+                if (template === 'joey' && config.uuid) bindings.push({ name: "u", type: "plain_text", text: config.uuid });
+
+                const defaultVars = TEMPLATES[template].defaultVars;
+                defaultVars.forEach(key => {
+                    if (key !== 'KV' && key !== 'C' && key !== 'ADMIN' && key !== 'u') {
+                        if (key === 'UUID') {
+                            bindings.push({ name: "UUID", type: "plain_text", text: config.uuid || crypto.randomUUID() });
+                        } else {
+                            bindings.push({ name: key, type: "plain_text", text: "" });
+                        }
+                    }
+                });
+            }
 
             const metadata = { main_module: "index.js", bindings: bindings, compatibility_date: new Date().toISOString().split('T')[0] };
             const formData = new FormData();
@@ -518,31 +496,51 @@ async function handleBatchDeploy(env, reqData, accountsKey) {
     return new Response(JSON.stringify(logs), { headers: { "Content-Type": "application/json" } });
 }
 
-// 核心部署逻辑 (支持服务器端混淆)
-async function coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, enableServerObfuscate = false) {
+// 核心部署逻辑
+async function coreDeployLogic(env, type, variables, deletedVariables, accountsKey, targetSha, customCode = null) {
     try {
+        // 规范化：'latest' 和空值统一视为“跟随最新”
+        const isLatestMode = !targetSha || targetSha === 'latest';
+        const shaForFetch = isLatestMode ? null : targetSha;
+
         const accounts = JSON.parse(await env.CONFIG_KV.get(accountsKey) || "[]");
         if (accounts.length === 0) return [{ name: "提示", success: false, msg: "无账号配置" }];
 
-        const { scriptUrl, apiUrl } = getGithubUrls(type, targetSha);
         let githubScriptContent = "";
-        let deployedSha = targetSha;
+        let deployedSha = shaForFetch;
 
-        try {
-            const codeRes = await fetch(scriptUrl + `?t=${Date.now()}`);
-            if (!codeRes.ok) throw new Error(`代码下载失败: ${codeRes.status}`);
-            githubScriptContent = await codeRes.text();
-
+        if (customCode) {
+            // 前端已提供混淆后的代码，直接使用
+            githubScriptContent = customCode;
             if (!deployedSha) {
+                // 获取最新 commit SHA
+                const { apiUrl } = getGithubUrls(type, null);
                 const headers = { "User-Agent": "CF-Worker" };
                 if (env.GITHUB_TOKEN) headers["Authorization"] = `token ${env.GITHUB_TOKEN}`;
-                const apiRes = await fetch(apiUrl + `?sha=${TEMPLATES[type].ghBranch}&per_page=1`, { headers });
-                if (apiRes.ok) {
-                    const commitData = (await apiRes.json())[0];
-                    deployedSha = commitData.sha;
-                }
+                try {
+                    const apiRes = await fetch(apiUrl + `?sha=${TEMPLATES[type].ghBranch}&per_page=1`, { headers });
+                    if (apiRes.ok) deployedSha = (await apiRes.json())[0].sha;
+                } catch (e) { }
             }
-        } catch (e) { return [{ name: "网络错误", success: false, msg: e.message }]; }
+        } else {
+            // 从 GitHub 下载代码
+            const { scriptUrl, apiUrl } = getGithubUrls(type, shaForFetch);
+            try {
+                const codeRes = await fetch(scriptUrl + `?t=${Date.now()}`);
+                if (!codeRes.ok) throw new Error(`代码下载失败: ${codeRes.status}`);
+                githubScriptContent = await codeRes.text();
+
+                if (!deployedSha) {
+                    const headers = { "User-Agent": "CF-Worker" };
+                    if (env.GITHUB_TOKEN) headers["Authorization"] = `token ${env.GITHUB_TOKEN}`;
+                    const apiRes = await fetch(apiUrl + `?sha=${TEMPLATES[type].ghBranch}&per_page=1`, { headers });
+                    if (apiRes.ok) {
+                        const commitData = (await apiRes.json())[0];
+                        deployedSha = commitData.sha;
+                    }
+                }
+            } catch (e) { return [{ name: "网络错误", success: false, msg: e.message }]; }
+        }
 
         if (type === 'joey') githubScriptContent = 'var window = globalThis;\n' + githubScriptContent;
         if (type === 'ech') {
@@ -552,10 +550,7 @@ async function coreDeployLogic(env, type, variables, deletedVariables, accountsK
             githubScriptContent = githubScriptContent.replace(regex, `const CF_FALLBACK_IPS = ['${targetIP}'];`);
         }
 
-        // [核心] 如果是自动部署/熔断，且启用了混淆，则执行服务器端混淆
-        if (enableServerObfuscate) {
-            githubScriptContent = serverSideObfuscate(githubScriptContent);
-        }
+
 
         const logs = [];
         for (const acc of accounts) {
@@ -590,7 +585,7 @@ async function coreDeployLogic(env, type, variables, deletedVariables, accountsK
 
                     if (updateRes.ok) {
                         logItem.success = true;
-                        logItem.msg = `✅ Ver: ${deployedSha ? deployedSha.substring(0, 7) : 'Unknown'}${enableServerObfuscate ? ' (Obfuscated)' : ''}`;
+                        logItem.msg = `✅ Ver: ${deployedSha ? deployedSha.substring(0, 7) : 'Unknown'}`;
                     } else {
                         logItem.msg = `❌ ${(await updateRes.json()).errors?.[0]?.message}`;
                     }
@@ -599,10 +594,12 @@ async function coreDeployLogic(env, type, variables, deletedVariables, accountsK
             }
         }
 
-        if (deployedSha) {
+        // 仅在至少有一个 worker 成功部署时才更新 DEPLOY_CONFIG
+        const hasSuccess = logs.some(l => l.success);
+        if (hasSuccess) {
             const DEPLOY_CONFIG_KEY = `DEPLOY_CONFIG_${type}`;
-            const mode = targetSha ? 'fixed' : 'latest';
-            await env.CONFIG_KV.put(DEPLOY_CONFIG_KEY, JSON.stringify({ mode: mode, currentSha: deployedSha, deployTime: new Date().toISOString() }));
+            const mode = isLatestMode ? 'latest' : 'fixed';
+            await env.CONFIG_KV.put(DEPLOY_CONFIG_KEY, JSON.stringify({ mode: mode, currentSha: deployedSha || 'unknown', deployTime: new Date().toISOString() }));
         }
         return logs;
     } catch (e) { return [{ name: "系统错误", success: false, msg: e.message }]; }
@@ -748,6 +745,14 @@ async function handleGetSubdomain(accountId, email, key) {
 async function handleChangeSubdomain(accountId, email, key, newSubdomain) {
     try {
         const headers = getAuthHeaders(email, key);
+        // Cloudflare API PUT subdomain 是 create-only，已有子域名需先 DELETE 再 PUT
+        // 先尝试删除旧子域名（可能失败，忽略错误继续）
+        try {
+            await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
+                method: 'DELETE', headers
+            });
+        } catch (e) { }
+        // 创建新子域名
         const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/workers/subdomain`, {
             method: 'PUT',
             headers,
@@ -757,9 +762,179 @@ async function handleChangeSubdomain(accountId, email, key, newSubdomain) {
         if (data.success) {
             return new Response(JSON.stringify({ success: true, subdomain: data.result?.subdomain || newSubdomain }), { headers: { "Content-Type": "application/json" } });
         } else {
-            return new Response(JSON.stringify({ success: false, msg: data.errors?.[0]?.message || '修改失败' }), { headers: { "Content-Type": "application/json" } });
+            const errMsg = data.errors?.[0]?.message || '修改失败';
+            // 如果仍然报已存在，说明 CF 不支持通过 API 修改，提示用户去 Dashboard
+            if (errMsg.includes('already has')) {
+                return new Response(JSON.stringify({ success: false, msg: 'Cloudflare 不支持通过 API 修改已有子域名，请到 Dashboard → Workers & Pages → 设置中手动修改。' }), { headers: { "Content-Type": "application/json" } });
+            }
+            return new Response(JSON.stringify({ success: false, msg: errMsg }), { headers: { "Content-Type": "application/json" } });
         }
     } catch (e) { return new Response(JSON.stringify({ success: false, msg: e.message }), { status: 500 }); }
+}
+
+// 一键修复 1101：删除 Worker → 改子域名 → 重建（带混淆）→ 恢复变量
+async function handleFix1101(env, type) {
+    const ACCOUNTS_KEY = `ACCOUNTS_UNIFIED_STORAGE`;
+    const accounts = JSON.parse(await env.CONFIG_KV.get(ACCOUNTS_KEY) || "[]");
+    if (accounts.length === 0) return new Response(JSON.stringify([{ name: "提示", success: false, msg: "无账号" }]), { headers: { "Content-Type": "application/json" } });
+
+    const logs = [];
+
+    // 1. 下载最新代码
+    const { scriptUrl, apiUrl } = getGithubUrls(type, null);
+    let freshCode;
+    try {
+        const codeRes = await fetch(scriptUrl + `?t=${Date.now()}`);
+        if (!codeRes.ok) throw new Error(`HTTP ${codeRes.status}`);
+        freshCode = await codeRes.text();
+    } catch (e) {
+        return new Response(JSON.stringify([{ name: "系统", success: false, msg: `代码下载失败: ${e.message}` }]), { headers: { "Content-Type": "application/json" } });
+    }
+
+    // 获取最新 SHA（用于更新 DEPLOY_CONFIG）
+    let latestSha = null;
+    try {
+        const hdrs = { "User-Agent": "CF-Worker" };
+        if (env.GITHUB_TOKEN) hdrs["Authorization"] = `token ${env.GITHUB_TOKEN}`;
+        const apiRes = await fetch(apiUrl + `?sha=${TEMPLATES[type].ghBranch}&per_page=1`, { headers: hdrs });
+        if (apiRes.ok) latestSha = (await apiRes.json())[0].sha;
+    } catch (e) { }
+
+    for (const acc of accounts) {
+        const targetWorkers = acc[`workers_${type}`] || [];
+        if (targetWorkers.length === 0) {
+            logs.push({ name: acc.alias, success: false, msg: "⏭️ 无此类 Worker，跳过" });
+            continue;
+        }
+
+        const headers = getAuthHeaders(acc.email, acc.globalKey);
+
+        for (const wName of targetWorkers) {
+            const logItem = { name: `${acc.alias} → [${wName}]`, success: false, msg: "" };
+            const steps = [];
+            try {
+                const baseUrl = `https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/scripts/${wName}`;
+
+                // Step 1: 记录当前变量绑定
+                let savedBindings = [];
+                try {
+                    const bindRes = await fetch(`${baseUrl}/bindings`, { headers });
+                    if (bindRes.ok) {
+                        savedBindings = (await bindRes.json()).result || [];
+                    }
+                } catch (e) { }
+                const varCount = savedBindings.filter(b => b.type === 'plain_text').length;
+                steps.push(`📋 记录 ${savedBindings.length} 个绑定 (${varCount} 变量)`);
+
+                // Step 1.5: 记录自定义域名
+                let savedDomains = [];
+                try {
+                    const domainsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/domains`, { headers });
+                    if (domainsRes.ok) {
+                        const allDomains = (await domainsRes.json()).result || [];
+                        savedDomains = allDomains.filter(d => d.service === wName);
+                    }
+                } catch (e) { }
+                if (savedDomains.length > 0) steps.push(`🔗 记录 ${savedDomains.length} 个自定义域名`);
+
+                // Step 2: 删除 Worker（不删 KV）
+                const delRes = await fetch(baseUrl, { method: "DELETE", headers });
+                if (!delRes.ok) {
+                    const err = await delRes.json();
+                    throw new Error(`删除失败: ${err.errors?.[0]?.message || delRes.status}`);
+                }
+                steps.push("🗑️ 已删除");
+
+                // Step 3: 随机修改子域名（容错，失败不阻断）
+                try {
+                    await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/subdomain`, { method: 'DELETE', headers });
+                    const randomSub = 'w' + Math.random().toString(36).substring(2, 8) + Math.floor(Math.random() * 99);
+                    const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/subdomain`, {
+                        method: 'PUT', headers,
+                        body: JSON.stringify({ subdomain: randomSub })
+                    });
+                    if (subRes.ok) steps.push(`🌐 子域名 → ${randomSub}`);
+                    else steps.push("🌐 子域名: 跳过(API限制)");
+                } catch (e) { steps.push("🌐 子域名: 跳过"); }
+
+                // Step 4: 重建 Worker + 恢复变量
+                let deployCode = freshCode;
+                if (type === 'joey') deployCode = 'var window = globalThis;\n' + deployCode;
+
+                // 从 KV 读取用户配置的变量值（VARS_cmliu / VARS_joey 等）
+                const varsStr = await env.CONFIG_KV.get(`VARS_${type}`);
+                const kvVars = varsStr ? JSON.parse(varsStr) : [];
+                const kvVarMap = new Map(kvVars.map(v => [v.key, v.value]));
+
+                // 恢复绑定：KV 变量值优先，其次 API 绑定值
+                const restoredBindings = savedBindings.map(b => {
+                    if (b.type === 'plain_text' || b.type === 'secret_text') {
+                        // 优先用 VARS_type 中的值
+                        const kvVal = kvVarMap.get(b.name);
+                        const val = (kvVal !== undefined && kvVal !== '') ? kvVal : (b.text || '');
+                        return { name: b.name, type: 'plain_text', text: val };
+                    }
+                    if (b.type === 'kv_namespace') return { name: b.name, type: 'kv_namespace', namespace_id: b.namespace_id };
+                    return b; // 其他类型原样返回
+                });
+                // 补充 KV 中有但 Bindings 中没有的变量
+                for (const [key, value] of kvVarMap) {
+                    if (!restoredBindings.find(b => b.name === key)) {
+                        restoredBindings.push({ name: key, type: 'plain_text', text: value || '' });
+                    }
+                }
+                const restoredVarCount = restoredBindings.filter(b => b.type === 'plain_text').length;
+
+                const metadata = {
+                    main_module: "index.js",
+                    bindings: restoredBindings,
+                    compatibility_date: new Date().toISOString().split('T')[0]
+                };
+                const formData = new FormData();
+                formData.append("metadata", JSON.stringify(metadata));
+                formData.append("script", new Blob([deployCode], { type: "application/javascript+module" }), "index.js");
+
+                const uploadHeaders = getUploadHeaders(acc.email, acc.globalKey);
+                const uploadRes = await fetch(baseUrl, { method: "PUT", headers: uploadHeaders, body: formData });
+
+                if (uploadRes.ok) {
+                    logItem.success = true;
+                    steps.push(`✅ 重建成功 (${restoredVarCount} 变量已恢复)`);
+
+                    // Step 5: 恢复自定义域名
+                    if (savedDomains.length > 0) {
+                        let domainOk = 0;
+                        for (const d of savedDomains) {
+                            try {
+                                const dRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.accountId}/workers/domains`, {
+                                    method: 'PUT', headers,
+                                    body: JSON.stringify({ hostname: d.hostname, service: wName, zone_id: d.zone_id, environment: d.environment || 'production' })
+                                });
+                                if (dRes.ok) domainOk++;
+                            } catch (e) { }
+                        }
+                        steps.push(`🔗 域名恢复 ${domainOk}/${savedDomains.length}`);
+                    }
+                } else {
+                    const err = await uploadRes.json();
+                    steps.push(`❌ 重建失败: ${err.errors?.[0]?.message}`);
+                }
+            } catch (err) {
+                steps.push(`❌ ${err.message}`);
+            }
+            logItem.msg = steps.join(' → ');
+            logs.push(logItem);
+        }
+    }
+
+    // 更新 DEPLOY_CONFIG
+    const hasSuccess = logs.some(l => l.success);
+    if (hasSuccess) {
+        const DEPLOY_CONFIG_KEY = `DEPLOY_CONFIG_${type}`;
+        await env.CONFIG_KV.put(DEPLOY_CONFIG_KEY, JSON.stringify({ mode: 'latest', currentSha: latestSha || 'unknown', deployTime: new Date().toISOString() }));
+    }
+
+    return new Response(JSON.stringify(logs), { headers: { "Content-Type": "application/json" } });
 }
 
 function loginHtml() {
@@ -798,10 +973,10 @@ function mainHtml() {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="manifest" href="/manifest.json">
-    <title>Worker 智能中控 (V10.2.0)</title>
+    <title>Worker 智能中控 (V10.6.0)</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
-    <script src="https://cdn.jsdelivr.net/npm/javascript-obfuscator/dist/index.browser.js"></script>
+
     <style>
       :root {
         --bg-page: #f1f5f9; --bg-card: #ffffff; --bg-card-alt: #f8fafc; --bg-input: #ffffff;
@@ -908,14 +1083,15 @@ function mainHtml() {
       
       <header class="bg-white px-4 py-3 md:px-6 md:py-4 rounded shadow flex flex-col lg:flex-row justify-between items-start lg:items-center gap-4">
           <div class="flex-none">
-              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V10.2.0</span></h1>
-              <div class="text-[10px] text-gray-400 mt-1">安全加固 · 熔断混淆 · 子域名管理 · 星空主题</div>
+              <h1 class="text-xl font-bold text-slate-800 flex items-center gap-2">🚀 Worker 部署中控 <span class="text-xs bg-purple-600 text-white px-2 py-0.5 rounded ml-2">V10.6.0</span></h1>
+              <div class="text-[10px] text-gray-400 mt-1">安全加固 · 熔断轮换 · 子域名管理 · 星空主题</div>
           </div>
           <div id="logs" class="bg-slate-900 text-green-400 p-2 rounded text-xs font-mono hidden max-h-[80px] lg:max-h-[50px] overflow-y-auto shadow-inner w-full lg:flex-1 lg:mx-4 order-2 lg:order-none"></div>
           
           <div class="flex flex-wrap items-center gap-2 md:gap-3 bg-slate-50 p-2 rounded border border-slate-200 w-full lg:w-auto flex-none text-xs">
                <button onclick="toggleTheme()" class="theme-toggle" id="theme_btn" title="切换主题">🌙</button>
                <div class="w-px h-4 bg-gray-300 mx-0"></div>
+               <button onclick="openWorkbench()" id="btn_workbench" class="bg-slate-700 text-white px-2 py-1 rounded hover:bg-slate-800 font-bold">📋 工作台</button>
                <button onclick="openBatchDeployModal()" class="bg-indigo-600 text-white px-2 py-1 rounded hover:bg-indigo-700 font-bold">✨ 批量部署</button>
                <div class="w-px h-4 bg-gray-300 mx-1"></div>
                
@@ -926,10 +1102,7 @@ function mainHtml() {
                       <label for="auto_update_toggle" class="toggle-label block overflow-hidden h-4 rounded-full bg-gray-300 cursor-pointer"></label>
                   </div>
                </div>
-               <div class="flex items-center gap-1">
-                  <span>自动混淆:</span>
-                  <input type="checkbox" id="auto_obfuscate_toggle" class="w-4 h-4 text-purple-600 border-gray-300 rounded"/>
-               </div>
+
                <div class="flex items-center gap-1">
                   <input type="number" id="auto_update_interval" value="30" class="w-8 text-center border rounded py-0.5"><span>分</span>
                </div>
@@ -1014,6 +1187,7 @@ function mainHtml() {
                         <button onclick="refreshUUID('cmliu')" class="flex-1 bg-gray-100 text-gray-600 text-xs py-1.5 rounded">🎲 刷 UUID</button>
                         <button onclick="deploy('cmliu')" id="btn_deploy_cmliu" class="flex-[2] bg-red-600 text-white text-xs py-1.5 rounded font-bold hover:bg-red-700">🚀 部署更新</button>
                     </div>
+                    <button onclick="fix1101('cmliu')" id="btn_fix1101_cmliu" class="w-full mt-2 bg-orange-500 text-white text-xs py-1.5 rounded font-bold hover:bg-orange-600">🔧 一键修复 1101</button>
                 </div>
             </div>
 
@@ -1056,7 +1230,7 @@ function mainHtml() {
     <div id="batch_deploy_modal" class="hidden fixed inset-0 bg-black bg-opacity-60 flex justify-center items-center z-50">
         <div class="bg-white rounded-lg w-[600px] shadow-2xl overflow-hidden animate-fade-in">
             <div class="bg-indigo-600 p-3 flex justify-between items-center text-white">
-                <h3 class="font-bold text-sm">✨ 批量部署 (Obfuscator Pro)</h3>
+                <h3 class="font-bold text-sm">✨ 批量部署</h3>
                 <button onclick="document.getElementById('batch_deploy_modal').classList.add('hidden')" class="hover:text-gray-200">×</button>
             </div>
             <div class="p-4 text-xs space-y-3">
@@ -1073,18 +1247,10 @@ function mainHtml() {
                             <label for="bd_enable_kv" class="font-bold text-gray-700">绑定 KV 存储</label>
                          </div>
                          <div class="flex items-center gap-2">
-                            <input type="checkbox" id="bd_obfuscate" class="w-4 h-4 text-red-600 border-gray-300 rounded" onchange="toggleObfuscatePanel()">
-                            <label for="bd_obfuscate" class="font-bold text-red-600">⚡ 启用代码混淆 (前端)</label>
+                            <input type="checkbox" id="bd_use_saved_vars" class="w-4 h-4 text-green-600 border-gray-300 rounded" checked>
+                            <label for="bd_use_saved_vars" class="font-bold text-green-700">📦 采用已保存变量 (VARS)</label>
                          </div>
                     </div>
-                </div>
-                
-                <div id="obfuscate_panel" class="hidden bg-gray-800 text-green-400 p-2 rounded text-[10px] font-mono border border-gray-600">
-                    <div class="flex justify-between items-center mb-1">
-                        <span>自定义混淆代码 (留空则自动拉取并混淆):</span>
-                        <button onclick="document.getElementById('bd_custom_code').value=''" class="text-gray-400 hover:text-white">清空</button>
-                    </div>
-                    <textarea id="bd_custom_code" class="w-full h-24 bg-gray-900 border-0 p-1 text-xs focus:ring-0" placeholder="// 在此粘贴 obfuscator.io 的结果，或者保持空白由系统自动混淆..."></textarea>
                 </div>
 
                 <div class="bg-slate-50 p-2 rounded border">
@@ -1193,6 +1359,21 @@ function mainHtml() {
         </div>
     </div>
 
+    <div id="workbench_modal" class="hidden fixed inset-0 z-50" style="pointer-events:none">
+        <div id="workbench_panel" class="bg-slate-900 rounded-xl shadow-2xl flex flex-col border border-slate-700" style="pointer-events:auto;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:700px;max-width:90vw;height:50vh;max-height:80vh;resize:both;overflow:hidden">
+            <div id="workbench_drag" class="flex justify-between items-center px-4 py-2 border-b border-slate-700 cursor-move select-none" style="cursor:move">
+                <h3 class="text-sm font-bold text-green-400 flex items-center gap-2">📋 工作台 <span id="wb_status" class="text-[10px] text-slate-500 font-normal"></span></h3>
+                <div class="flex gap-2">
+                    <button onclick="document.getElementById('workbench_log').innerHTML=''" class="text-[10px] text-slate-500 hover:text-slate-300 border border-slate-600 px-2 py-0.5 rounded">🗑️ 清空</button>
+                    <button onclick="closeWorkbench()" class="text-slate-400 hover:text-white text-lg leading-none">&times;</button>
+                </div>
+            </div>
+            <div id="workbench_log" class="flex-1 overflow-y-auto p-3 text-xs font-mono text-green-400 space-y-0.5">
+                <div class="text-slate-600">// 等待操作...</div>
+            </div>
+        </div>
+    </div>
+
     <script>
       const TEMPLATES = ${JSON.stringify(Object.fromEntries(Object.entries(TEMPLATES).map(([k, v]) => [k, { defaultVars: v.defaultVars, uuidField: v.uuidField, name: v.name }])))};
       const ECH_PROXIES = ${JSON.stringify(ECH_PROXIES)};
@@ -1211,6 +1392,46 @@ function mainHtml() {
           loadStats();
           ['cmliu','joey'].forEach(t => { checkDeployConfig(t); checkUpdate(t); });
       }
+
+      function openWorkbench() {
+          document.getElementById('workbench_modal').classList.remove('hidden');
+      }
+      function closeWorkbench() {
+          document.getElementById('workbench_modal').classList.add('hidden');
+      }
+      function wbLog(msg, colorClass) {
+          const log = document.getElementById('workbench_log');
+          const div = document.createElement('div');
+          if (colorClass) div.className = colorClass;
+          div.textContent = msg;
+          log.appendChild(div);
+          log.scrollTop = log.scrollHeight;
+      }
+
+      // 工作台拖动
+      (function initDrag() {
+          let isDragging = false, startX, startY, startLeft, startTop;
+          document.addEventListener('mousedown', e => {
+              const drag = document.getElementById('workbench_drag');
+              if (!drag || !drag.contains(e.target) || e.target.tagName === 'BUTTON') return;
+              const panel = document.getElementById('workbench_panel');
+              isDragging = true;
+              const rect = panel.getBoundingClientRect();
+              panel.style.transform = 'none';
+              panel.style.left = rect.left + 'px';
+              panel.style.top = rect.top + 'px';
+              startX = e.clientX; startY = e.clientY;
+              startLeft = rect.left; startTop = rect.top;
+              e.preventDefault();
+          });
+          document.addEventListener('mousemove', e => {
+              if (!isDragging) return;
+              const panel = document.getElementById('workbench_panel');
+              panel.style.left = Math.max(0, startLeft + e.clientX - startX) + 'px';
+              panel.style.top = Math.max(0, startTop + e.clientY - startY) + 'px';
+          });
+          document.addEventListener('mouseup', () => { isDragging = false; });
+      })();
 
       async function fetchZonesForAccount() {
           const email = document.getElementById('in_email').value;
@@ -1245,76 +1466,24 @@ function mainHtml() {
           }
       }
 
-      // 批量部署逻辑（核心：包含混淆与 RuntimeFix）
+      // 批量部署逻辑
       async function doBatchDeploy() {
           const btn = document.getElementById('btn_do_batch');
           const t = document.getElementById('bd_template').value;
           const name = document.getElementById('bd_name').value;
           const kvName = document.getElementById('bd_kv_name').value;
           const enableKV = document.getElementById('bd_enable_kv').checked;
-          const enableObfuscate = document.getElementById('bd_obfuscate').checked;
-          let customCode = document.getElementById('bd_custom_code').value;
+          const useSavedVars = document.getElementById('bd_use_saved_vars').checked;
 
           if (!name) return Swal.fire('提示', 'Worker名称必填', 'warning');
           if (enableKV && !kvName) return Swal.fire('提示', '开启 KV 绑定时必须填写 KV 名称', 'warning');
           
           btn.disabled = true;
           btn.innerText = "⏳ 准备中...";
-          const logBox = document.getElementById('logs');
-          logBox.classList.remove('hidden');
+          openWorkbench();
+          wbLog('✨ 开始批量部署...', 'text-yellow-400');
           
           try {
-             if (enableObfuscate && !customCode.trim()) {
-                 logBox.innerHTML = '<div class="text-yellow-300">⚡ 1. Fetching Code...</div>';
-                 const r = await fetch(\`/api/get_code?type=\${t}\`);
-                 const d = await r.json();
-                 if(!d.success) throw new Error(d.msg);
-                 
-                 let sourceCode = d.code;
-                 
-                 // [智能注入 window polyfill]
-                 if (sourceCode.includes('import ') || sourceCode.includes('export ')) {
-                     logBox.innerHTML += '<div class="text-blue-300">💉 2. Injecting Polyfill (Module Mode)...</div>';
-                     const lines = sourceCode.split('\\n');
-                     let lastImportIndex = -1;
-                     lines.forEach((line, index) => {
-                         if (line.trim().startsWith('import ')) lastImportIndex = index;
-                     });
-                     if (lastImportIndex !== -1) {
-                         lines.splice(lastImportIndex + 1, 0, 'var window = globalThis;');
-                         sourceCode = lines.join('\\n');
-                     } else {
-                         sourceCode = 'var window = globalThis;\\n' + sourceCode;
-                     }
-                 } else {
-                     sourceCode = 'var window = globalThis;\\n' + sourceCode;
-                 }
-
-                 logBox.innerHTML += '<div class="text-purple-300">🔒 3. Obfuscating (High Compatibility)...</div>';
-                 
-                 // [V9.9.5 修复] 禁用控制台拦截，确保兼容 Worker 环境
-                 const obfuscationResult = JavaScriptObfuscator.obfuscate(sourceCode, {
-                    target: 'service-worker', 
-                    compact: true,
-                    controlFlowFlattening: true,
-                    controlFlowFlatteningThreshold: 0.75,
-                    deadCodeInjection: true,
-                    deadCodeInjectionThreshold: 0.4,
-                    debugProtection: false,   
-                    disableConsoleOutput: false, 
-                    identifierNamesGenerator: 'hexadecimal',
-                    log: false,
-                    renameGlobals: false,
-                    rotateStringArray: true,
-                    selfDefending: false,     
-                    stringArray: true,
-                    stringArrayEncoding: ['base64', 'rc4'],
-                    stringArrayThreshold: 0.75,
-                    unicodeEscapeSequence: false
-                });
-                customCode = obfuscationResult.getObfuscatedCode();
-                logBox.innerHTML += '<div class="text-green-300">✅ Obfuscation Complete!</div>';
-             }
 
              btn.innerText = "🚀 部署中...";
              const chks = document.querySelectorAll('.bd-acc-chk:checked');
@@ -1328,34 +1497,55 @@ function mainHtml() {
                   config.uuid = document.getElementById('bd_uuid').value;
              }
 
-             const res = await fetch('/api/batch_deploy', {
-                  method: 'POST',
-                  body: JSON.stringify({ 
-                      template: t, 
-                      workerName: name, 
-                      kvName: kvName, 
-                      config: config, 
-                      targetAccounts: targetAccounts,
-                      disableWorkersDev: document.getElementById('bd_disable_workers_dev').checked,
-                      customDomainPrefix: document.getElementById('bd_domain_prefix').value,
-                      enableKV: enableKV,
-                      customCode: customCode 
-                  })
-              });
-              const logs = await res.json();
-              logBox.innerHTML = logs.map(l => {
-                  if (l.success && l.msg.startsWith('✅')) return \`<div>✅ <span class="text-white">\${l.msg.replace('✅ ', '')}</span></div>\`;
-                  return \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`;
-              }).join('');
-              
-              document.getElementById('batch_deploy_modal').classList.add('hidden');
-              await loadAccounts(); 
-              Swal.fire('完成', '操作完成，请查看日志', 'success');
+             // 如果勾选了「采用已保存变量」，从 KV 读取并合并
+              let savedVars = null;
+              if (useSavedVars) {
+                  wbLog('📦 读取已保存变量 (VARS_' + t + ')...', 'text-blue-300');
+                  try {
+                      const vr = await fetch(\`/api/settings?type=\${t}\`);
+                      savedVars = await vr.json();
+                      if (Array.isArray(savedVars) && savedVars.length > 0) {
+                          wbLog(\`✅ 读取到 \${savedVars.length} 个变量\`, 'text-green-300');
+                          // 将 config 中的值合并到 savedVars
+                          Object.entries(config).forEach(([k, v]) => {
+                              if (v) {
+                                  const idx = savedVars.findIndex(sv => sv.key === k);
+                                  if (idx !== -1) savedVars[idx].value = v;
+                                  else savedVars.push({ key: k, value: v });
+                              }
+                          });
+                      } else { savedVars = null; }
+                  } catch(e) { savedVars = null; }
+              }
 
-          } catch(e) { 
-              Swal.fire('错误', '部署失败: ' + e.message, 'error'); 
-              logBox.innerHTML += \`<div class="text-red-500">❌ Error: \${e.message}</div>\`;
-          }
+              const res = await fetch('/api/batch_deploy', {
+                   method: 'POST',
+                   body: JSON.stringify({ 
+                       template: t, 
+                       workerName: name, 
+                       kvName: kvName, 
+                       config: config, 
+                       targetAccounts: targetAccounts,
+                       disableWorkersDev: document.getElementById('bd_disable_workers_dev').checked,
+                       customDomainPrefix: document.getElementById('bd_domain_prefix').value,
+                       enableKV: enableKV,
+                       savedVars: savedVars 
+                   })
+               });
+              const logs = await res.json();
+               logs.forEach(l => {
+                   if (l.success && l.msg.startsWith('✅')) wbLog(\`✅ \${l.msg.replace('✅ ', '')}\`, 'text-white');
+                   else wbLog(\`[\${l.success ? 'OK' : 'ERR'}] \${l.name}: \${l.msg}\`, l.success ? '' : 'text-red-400');
+               });
+               
+               document.getElementById('batch_deploy_modal').classList.add('hidden');
+               await loadAccounts(); 
+               Swal.fire('完成', '操作完成，请查看工作台', 'success');
+
+           } catch(e) { 
+               Swal.fire('错误', '部署失败: ' + e.message, 'error'); 
+               wbLog(\`❌ Error: \${e.message}\`, 'text-red-500');
+           }
           btn.disabled = false;
           btn.innerText = "🚀 开始部署";
       }
@@ -1383,10 +1573,7 @@ function mainHtml() {
           if (t === 'joey') kvCheck.checked = false; else kvCheck.checked = true;
       }
 
-      function toggleObfuscatePanel() {
-          const chk = document.getElementById('bd_obfuscate').checked;
-          document.getElementById('obfuscate_panel').classList.toggle('hidden', !chk);
-      }
+
 
       let currentManageAccIndex = -1;
 
@@ -1631,9 +1818,41 @@ function mainHtml() {
          const btn = document.getElementById(\`btn_deploy_\${t}\`); const ot = btn.innerText; btn.innerText = "⏳ 部署中..."; btn.disabled = true;
          const vars = []; document.querySelectorAll(\`.var-row-\${t}\`).forEach(r => { const k = r.querySelector('.key').value; const v = r.querySelector('.val').value; if(k) vars.push({key: k, value: v}); });
          await fetch(\`/api/settings?type=\${t}\`, {method: 'POST', body: JSON.stringify(vars)});
-         const logBox = document.getElementById('logs'); logBox.classList.remove('hidden'); logBox.innerHTML = \`<div class="text-yellow-400">⚡ Deploying \${t}...</div>\`;
-         try { const res = await fetch(\`/api/deploy?type=\${t}\`, { method: 'POST', body: JSON.stringify({ type: t, variables: vars, deletedVariables: deletedVars[t], targetSha: sha }) }); const logs = await res.json(); logBox.innerHTML += logs.map(l => \`<div>[\${l.success ? 'OK' : 'ERR'}] \${l.name}: <span class="text-gray-400">\${l.msg}</span></div>\`).join(''); deletedVars[t] = []; setTimeout(() => { checkUpdate(t); checkDeployConfig(t); }, 1000); } catch(e) { logBox.innerHTML += \`<div class="text-red-500">Error: \${e.message}</div>\`; }
+         openWorkbench();
+         wbLog(\`⚡ Deploying \${t}...\`, 'text-yellow-400');
+         try {
+             const res = await fetch(\`/api/deploy?type=\${t}\`, { method: 'POST', body: JSON.stringify({ type: t, variables: vars, deletedVariables: deletedVars[t], targetSha: sha }) });
+             const logs = await res.json();
+             logs.forEach(l => wbLog(\`[\${l.success ? 'OK' : 'ERR'}] \${l.name}: \${l.msg}\`, l.success ? '' : 'text-red-400'));
+             deletedVars[t] = [];
+             setTimeout(() => { checkUpdate(t); checkDeployConfig(t); }, 1000);
+         } catch(e) { wbLog(\`Error: \${e.message}\`, 'text-red-500'); }
          btn.innerText = ot; btn.disabled = false;
+      }
+
+      async function fix1101(t) {
+          const confirm = await Swal.fire({
+              title: '🔧 一键修复 1101',
+              html: '<div class="text-left text-sm"><p class="mb-2">将对所有账号执行：</p><ol class="list-decimal pl-5 space-y-1"><li>📋 记录变量绑定 + 自定义域名</li><li>🗑️ 删除 Worker</li><li>🌐 随机修改子域名</li><li>🚀 用相同名称重建</li><li>♻️ 恢复所有变量值 + 自定义域名</li></ol><p class="mt-3 text-orange-600 font-bold">⚠️ 子域名变更影响该账号下所有 Worker！</p></div>',
+              icon: 'warning', showCancelButton: true,
+              confirmButtonText: '执行修复', cancelButtonText: '取消',
+              confirmButtonColor: '#f97316'
+          });
+          if (!confirm.isConfirmed) return;
+          const btn = document.getElementById('btn_fix1101_' + t); const ot = btn.innerText; btn.innerText = '⏳ 修复中...'; btn.disabled = true;
+          openWorkbench();
+          wbLog('🔧 正在修复 ' + t + ' 的 1101...', 'text-orange-400');
+          try {
+              const res = await fetch('/api/fix_1101', { method: 'POST', body: JSON.stringify({ type: t }) });
+              const logs = await res.json();
+              logs.forEach(l => {
+                  const color = l.success ? 'text-green-300' : 'text-red-400';
+                  wbLog('[' + (l.success ? '✅' : '❌') + '] ' + l.name, color);
+                  if (l.msg) l.msg.split(' | ').forEach(s => wbLog('   ' + s, 'text-slate-400'));
+              });
+              setTimeout(() => { checkUpdate(t); checkDeployConfig(t); }, 1000);
+          } catch(e) { wbLog('Error: ' + e.message, 'text-red-500'); }
+          btn.innerText = ot; btn.disabled = false;
       }
 
       function selectSyncAccount(t) {
@@ -1673,9 +1892,9 @@ function mainHtml() {
       function removeVarRow(b,t){ const k=b.parentElement.querySelector('.key').value; if(k)deletedVars[t].push(k); b.parentElement.remove(); }
       async function loadVars(t){ const c=document.getElementById(\`vars_\${t}\`); c.innerHTML='<div class="text-center text-gray-300">...</div>'; try{ const r=await fetch(\`/api/settings?type=\${t}\`); const v=await r.json(); const m=new Map(); if(Array.isArray(v))v.forEach(x=>m.set(x.key,x.value)); TEMPLATES[t].defaultVars.forEach(k=>{ if(!m.has(k))m.set(k,k===TEMPLATES[t].uuidField?crypto.randomUUID():'') }); c.innerHTML=''; deletedVars[t]=[]; m.forEach((val,key)=>addVarRow(t,key,val)); }catch(e){ c.innerHTML='Load Error'; } }
       
-      // Auto Config 包含混淆开关
-      async function loadGlobalConfig(){ try{ const r=await fetch('/api/auto_config'); const c=await r.json(); document.getElementById('auto_update_toggle').checked=!!c.enabled; document.getElementById('auto_obfuscate_toggle').checked=!!c.obfuscate; document.getElementById('auto_update_interval').value=c.interval||30; document.getElementById('fuse_threshold').value=c.fuseThreshold||0; }catch(e){} }
-      async function saveAutoConfig(){ await fetch('/api/auto_config',{method:'POST',body:JSON.stringify({enabled:document.getElementById('auto_update_toggle').checked, obfuscate:document.getElementById('auto_obfuscate_toggle').checked, interval:document.getElementById('auto_update_interval').value, fuseThreshold:document.getElementById('fuse_threshold').value})}); alert('已保存配置'); }
+      // Auto Config
+      async function loadGlobalConfig(){ try{ const r=await fetch('/api/auto_config'); const c=await r.json(); document.getElementById('auto_update_toggle').checked=!!c.enabled; document.getElementById('auto_update_interval').value=c.interval||30; document.getElementById('fuse_threshold').value=c.fuseThreshold||0; }catch(e){} }
+      async function saveAutoConfig(){ await fetch('/api/auto_config',{method:'POST',body:JSON.stringify({enabled:document.getElementById('auto_update_toggle').checked, interval:document.getElementById('auto_update_interval').value, fuseThreshold:document.getElementById('fuse_threshold').value})}); alert('已保存配置'); }
       
       async function checkUpdate(t){ 
           const el=document.getElementById(\`ver_\${t}\`); 
